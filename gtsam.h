@@ -2706,7 +2706,19 @@ class JCBB {
   gtsam::KeyVector match() const;
 };
 
+template<POSE, POINT, BEARING, RANGE>
+class MHJCBB {
+  MHJCBB(int max_tracks, double prob, double posterior_pose_md_threshold);
+
+  void initialize(const gtsam::NonlinearFactorGraph &graph, const gtsam::Values &values);
+  void add(BEARING measureBearing, RANGE measuredRange, const gtsam::noiseModel::Base *model);
+  void match();
+  int size() const;
+  pair<int, gtsam::KeyVector> get(int i) const;
+};
+
 typedef gtsam::da::JCBB<gtsam::Pose2, gtsam::Point2, gtsam::Rot2, double> JCBB2;
+typedef gtsam::da::MHJCBB<gtsam::Pose2, gtsam::Point2, gtsam::Rot2, double> MHJCBB2;
 } //\namespace da
 
 } // namespace gtsam

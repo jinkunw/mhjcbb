@@ -4,11 +4,11 @@ import gtsam
 
 class Simulator(object):
     def __init__(self, seed=0):
-        self.sigma_x = 0.03
-        self.sigma_y = 0.03
-        self.sigma_theta = 0.03
-        self.sigma_bearing = 0.03
-        self.sigma_range = 0.03
+        self.sigma_x = 0.1
+        self.sigma_y = 0.1
+        self.sigma_theta = 0.05
+        self.sigma_bearing = 0.05
+        self.sigma_range = 0.1
 
         self.max_range = 5.0
         self.max_bearing = np.pi / 3.0

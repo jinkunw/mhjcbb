@@ -1,7 +1,5 @@
 #pragma once
 #include <gtsam/base/FastVector.h>
-#include <gtsam/geometry/Pose2.h>
-#include <gtsam/geometry/Rot2.h>
 #include <gtsam/inference/Key.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/linear/NoiseModel.h>
@@ -9,7 +7,7 @@
 #include <gtsam/sam/BearingRangeFactor.h>
 #include <Eigen/Cholesky>
 
-#include <priority_queue>
+#include <queue>
 #include <stack>
 
 namespace gtsam {
@@ -18,32 +16,36 @@ namespace da {
 using symbol_shorthand::L;
 using symbol_shorthand::X;
 
+/// Chi-square inverse cumulative distribution function
 double chi2inv(double P, unsigned int dim);
 
 struct Innovation {
   typedef std::shared_ptr<Innovation> shared_ptr;
-  Key l;
-  Vector error;
-  Matrix Hx;
-  Matrix Hl;
-  Vector sigmas;
-  double md;
+  Key l;          // landmark key
+  Vector error;   // residual error
+  Matrix Hx;      // Jacobian w.r.t. pose
+  Matrix Hl;      // Jacobian w.r.t. point
+  Vector sigmas;  // measurement noise
+  double md;      // Mahalanobis distance
 };
 
 template <typename POSE, typename POINT,
           typename BEARING = typename Bearing<POSE, POINT>::result_type,
           typename RANGE = typename Range<POSE, POINT>::result_type>
 class JCBB {
-  typedef BearingRange<POSE, POINT> BearingRange;
-  typedef BearingRangeFactor<POSE, POINT> BearingRangeFactor;
-
  public:
+  /// Initialize JCBB with a complete factor graph and an estimate.
+  /// Assume
+  ///   1. Pose and landmark keys are represented by X(x) and L(l).
+  ///   2. Pose keys are incremental from 0 to N.
+  ///   3. The associated landmark keys are also incremental.
   JCBB(const NonlinearFactorGraph &graph, const Values &values, double prob)
       : values_(values), prob_(prob) {
     marginals_ = Marginals(graph, values_);
     for (Key key : values_.keys())
       if (symbolChr(key) == 'l') keys_.push_back(key);
 
+    // Find the latest pose key
     for (int x = 0;; ++x) {
       if (!values_.exists(X(x))) {
         assert(x > 0);
@@ -54,12 +56,15 @@ class JCBB {
     }
   }
 
+  /// Add current measurement with noise model.
+  /// Only diagonal noise model is supported.
   void add(BEARING measuredBearing, RANGE measuredRange,
            const SharedNoiseModel &model) {
+    // Search landmark candidates that is likely to be independently compatible.
     innovations_.push_back({});
     for (Key l : keys_) {
       POINT point = values_.at<POINT>(l);
-      BearingRangeFactor factor(x0_, l, measuredBearing, measuredRange, model);
+      BearingRangeFactor<POSE, POINT> factor(x0_, l, measuredBearing, measuredRange, model);
 
       Innovation::shared_ptr inn(new Innovation);
       inn->l = l;
@@ -73,6 +78,8 @@ class JCBB {
     }
   }
 
+  /// Perform JCBB data association.
+  /// Return landmark keys for measurements.
   KeyVector match() {
     KeyVector keys;
     keys.push_back(x0_);
@@ -83,14 +90,18 @@ class JCBB {
     }
     joint_marginals_ = marginals_.jointMarginalCovariance(keys);
 
+    // Sort candidate landmarks by its residual.
+    // A heuristic to quickly obtain a lower bound.
     for (FastVector<Innovation::shared_ptr> &linn : innovations_)
       std::sort(linn.begin(), linn.end(),
                 [](Innovation::shared_ptr lhs, Innovation::shared_ptr rhs) {
                   return lhs->md < rhs->md;
                 });
 
+    // Recursive search in interpretation tree starting with an empty hypothesis.
     jcbb({});
 
+    // Map innovations to keys.
     KeyVector matched_keys;
     int new_l = 0;
     for (Innovation::shared_ptr &inn : best_hypothesis_)
@@ -113,8 +124,10 @@ class JCBB {
       if (inn) existing.insert(inn->l);
 
     for (Innovation::shared_ptr &inn : innovations_[k]) {
+      // Make sure keys are used only once.
       if (existing.find(inn->l) != existing.end()) continue;
 
+      // Get remaining keys if we associate k-th measurement with inn->l.
       FastSet<Key> remaining;
       for (int j = k + 1; j < innovations_.size(); ++j) {
         for (Innovation::shared_ptr &future_inn : innovations_[j]) {
@@ -123,14 +136,20 @@ class JCBB {
             remaining.insert(future_inn->l);
         }
       }
+
+      // Calculate the max pairings (upper bound) we can achieve with this association.
       int max_remaining =
           std::min(remaining.size(), innovations_.size() - k - 1);
+      // Stop searching if upper bound <= current lower bound.
       if (h + 1 + max_remaining <= pairings(best_hypothesis_)) continue;
 
+      // Keep searching in interpretation tree if current hypothesis is JC.
       FastVector<Innovation::shared_ptr> extended = hypothesis;
       extended.push_back(inn);
       if (jc(extended)) jcbb(extended);
     }
+
+    // Same as above but with a null pairing.
     FastSet<Key> remaining;
     for (int j = k + 1; j < innovations_.size(); ++j) {
       for (Innovation::shared_ptr &future_inn : innovations_[j]) {
@@ -147,13 +166,16 @@ class JCBB {
     }
   }
 
+  /// Calculate non-null pairings in the hypothesis.
   int pairings(const FastVector<Innovation::shared_ptr> &hypothesis) const {
     return std::count_if(
         hypothesis.cbegin(), hypothesis.cend(),
         [](const Innovation::shared_ptr &inn) { return inn != nullptr; });
   }
 
+  /// Fast independent compatibility (IC) test.
   bool jc_(const Innovation::shared_ptr &inn) const {
+    // Assume two variables are independent
     Matrix S = Matrix::Zero(5, 5);
     S.block<3, 3>(0, 0) = marginals_.marginalCovariance(x0_);
     S.block<2, 2>(3, 3) = marginals_.marginalCovariance(inn->l);
@@ -170,11 +192,15 @@ class JCBB {
     return chi2 < chi2inv(prob_, 2);
   }
 
+  /// Joint compatibility (JC) test.
   bool jc(const FastVector<Innovation::shared_ptr> &hypothesis) const {
-    if (hypothesis.size() <= 1) return true;
+    if (hypothesis.empty() || pairings(hypothesis) == 0)
+      return true;
 
+    // Calculate covariance from GTSAM joint marginals.
+    // TODO: incremental update
     int XD = POSE::dimension, LD = POINT::dimension,
-        FD = BearingRange::dimension;
+        FD = BearingRange<POSE, POINT>::dimension;
     int N = XD, M = 0;
     KeyVector keys;
     keys.push_back(x0_);
@@ -234,39 +260,50 @@ template <typename POSE, typename POINT,
           typename BEARING = typename Bearing<POSE, POINT>::result_type,
           typename RANGE = typename Range<POSE, POINT>::result_type>
 class MHJCBB {
-  typedef BearingRange<POSE, POINT> BearingRange;
-  typedef BearingRangeFactor<POSE, POINT> BearingRangeFactor;
-
+ private:
+  /// Match information
   struct MatchInfo {
-    int track;
-    std::vector<Innovation> hypothesis;
-    int num_pairings;
-    double md;
-    POSE pose;
-    Matrix covariance;
+    int track;                                       // track index
+    std::vector<Innovation::shared_ptr> hypothesis;  // hypothesis
+    int num_pairings;                                // current pairings
+    double md;                                       // chi-squared error
+    POSE pose;                                       // posterior pose after update
+    Matrix covariance;                               // posterior covariance
   };
 
+  /// Compare two matching results.
   struct MatchInfoCmp {
     bool operator()(const MatchInfo &a, const MatchInfo &b) const {
-      return (a.num_pairings > b.num_pairings) || ((a.num_pairings == b.num_pairings) && (a.md < b.md));
+      return (a.num_pairings > b.num_pairings) ||
+             ((a.num_pairings == b.num_pairings) && (a.md < b.md));
     }
   };
 
+  /// Track information
   struct TrackInfo {
-    FastVector<FastVector<Innovation::shared_ptr>> innovations;
-    KeyVector keys;
+    int index;                                                   // track index
+    FastVector<FastVector<Innovation::shared_ptr>> innovations;  // candidates for each measurement
+    KeyVector keys;                                              // Same as members in JCBB
     Marginals marginals;
     JointMarginal joint_marginals;
     Values values;
     Key x0;
     POSE pose0;
 
-    std::stack<MatchInfo> stack;
+    std::stack<MatchInfo> stack;  // use stack to search in the interpretation tree
   };
 
  public:
-  MHJCBB(int max_tracks, double prob) : max_tracks_(max_tracks), prob_(prob) {}
+  /// MHJCBB
+  MHJCBB(int max_tracks,
+         double prob,
+         double posterior_pose_md_threshold)  // threshold used for screening match
+  : max_tracks_(max_tracks),
+    prob_(prob),
+    posterior_pose_md_threshold_(posterior_pose_md_threshold) {}
 
+  /// Initialize a track with a complete factor graph and estimate.
+  /// Call multiple times if there are multiple tracks.
   void initialize(const NonlinearFactorGraph &graph, const Values &values) {
     tracks_.push_back(TrackInfo());
     TrackInfo &track = tracks_.back();
@@ -284,15 +321,19 @@ class MHJCBB {
       }
     }
     track.stack.push(MatchInfo());
+    track.stack.top().track = tracks_.size() - 1;
+    track.stack.top().pose = track.pose0;
+    track.stack.top().covariance = track.marginals.marginalCovariance(track.x0);
   }
 
+  /// Add measurement to every track.
   void add(BEARING measuredBearing, RANGE measuredRange,
            const SharedNoiseModel &model) {
     for (TrackInfo &track : tracks_) {
       track.innovations.push_back({});
       for (Key l : track.keys) {
         POINT point = track.values.template at<POINT>(l);
-        BearingRangeFactor factor(track.x0, l, measuredBearing, measuredRange, model);
+        BearingRangeFactor<POSE, POINT> factor(track.x0, l, measuredBearing, measuredRange, model);
 
         Innovation::shared_ptr inn(new Innovation);
         inn->l = l;
@@ -300,69 +341,102 @@ class MHJCBB {
         inn->sigmas = model->sigmas();
         inn->md = model->distance(inn->error);
 
-        if (jc_(track, inn)) {
+        if (jc_(track, inn))
           track.innovations.back().push_back(inn);
-        }
       }
     }
   }
 
-  KeyVector match() {
+  /// MHJCBB match
+  void match() {
     for (TrackInfo &track : tracks_) {
+      // Same as JCBB
       KeyVector keys;
       keys.push_back(track.x0);
-      for (const std::vector<Innovation::shared_ptr> &obs_inn : innovations_) {
+      for (const std::vector<Innovation::shared_ptr> &obs_inn : track.innovations) {
         for (const Innovation::shared_ptr &inn : obs_inn)
           if (std::find(keys.begin(), keys.end(), inn->l) == keys.end())
             keys.push_back(inn->l);
       }
       track.joint_marginals = track.marginals.jointMarginalCovariance(keys);
 
+      // Sort in reverse order due to stack.
       for (FastVector<Innovation::shared_ptr> &linn : track.innovations)
         std::sort(linn.begin(), linn.end(),
                   [](Innovation::shared_ptr lhs, Innovation::shared_ptr rhs) {
-                    return lhs->md < rhs->md;
+                    return lhs->md > rhs->md;
                   });
     }
 
-    mhjcbb({});
+    mhjcbb();
 
-    KeyVector matched_keys;
-    int new_l = 0;
-    for (Innovation::shared_ptr &inn : best_hypothesis_)
-      matched_keys.push_back(inn ? inn->l : keys_.size() + new_l++);
-    return matched_keys;
+    // Map to keys.
+    while (!best_hypotheses_.empty()) {
+      MatchInfo mi = best_hypotheses_.top();
+      best_hypotheses_.pop();
+
+      KeyVector matched_keys;
+      int new_l = 0;
+      for (const Innovation::shared_ptr &inn : mi.hypothesis)
+        matched_keys.push_back(inn ? inn->l : tracks_[mi.track].keys.size() + new_l++);
+      result_.insert(result_.begin(), std::make_pair(mi.track, matched_keys));
+    }
   }
 
+  /// Access matching result.
+  int size() const { return result_.size(); }
+  std::pair<int, KeyVector> get(int i) const { return result_[i]; }
+
  private:
+  /// MHJCBB search in interpretation forest.
   void mhjcbb() {
     int tracks_done = 0;
-    while (tracks_done < max_tracks) {
+    int i = 0;
+    while (tracks_done < max_tracks_) {
       for (TrackInfo &ti : tracks_) {
+        // JCBB will return when one complete hypothesis is met.
         tracks_done += jcbb(ti);
       }
     }
-    prune();
+
+    screen2();
   }
 
+  /// JCBB in a track.
+  /// Return true if the search is done.
   bool jcbb(TrackInfo &ti) {
     while (!ti.stack.empty()) {
       MatchInfo mi = ti.stack.top();
       ti.stack.pop();
 
       int k = mi.hypothesis.size();
-      int h = pairings(ti.hypothesis);
+      int h = pairings(mi.hypothesis);
       if (k == ti.innovations.size()) {
-        if (jc(ti, mi) && screen(mi)) {
-          if (best_hypotheses_.size() == max_tracks_)
-            best_hypotheses_.pop();
+        if (jc(ti, mi) && screen1(mi)) {
           best_hypotheses_.push(mi);
+          if (best_hypotheses_.size() > max_tracks_)
+            best_hypotheses_.pop();
           return false;
         }
       } else {
         FastSet<Key> existing;
         for (const Innovation::shared_ptr &inn : mi.hypothesis)
           if (inn) existing.insert(inn->l);
+
+        FastSet<Key> remaining;
+        for (int j = k + 1; j < ti.innovations.size(); ++j) {
+          for (Innovation::shared_ptr &future_inn : ti.innovations[j]) {
+            if (existing.find(future_inn->l) == existing.end())
+              remaining.insert(future_inn->l);
+          }
+        }
+        int max_remaining = std::min(remaining.size(), ti.innovations.size() - k - 1);
+        if (best_hypotheses_.size() < max_tracks_ ||
+            h + max_remaining >= best_hypotheses_.top().num_pairings) {
+          MatchInfo extended = mi;
+          extended.hypothesis.push_back(nullptr);
+          ti.stack.push(extended);
+        }
 
         for (Innovation::shared_ptr &inn : ti.innovations[k]) {
           if (existing.find(inn->l) != existing.end()) continue;
@@ -378,41 +452,88 @@ class MHJCBB {
           int max_remaining =
               std::min(remaining.size(), ti.innovations.size() - k - 1);
           int future_pairings = h + 1 + max_remaining;
-          if (!best_hypotheses_.empty()) {
+          if (best_hypotheses_.size() == max_tracks_) {
             int min_pairings = best_hypotheses_.top().num_pairings;
             if (future_pairings < min_pairings)
               continue;
             if (best_hypotheses_.size() == ti.innovations.size() &&
-                future_pairings == min_pairings && mi.md > best_hypotheses.top().md)
+                future_pairings == min_pairings && mi.md > best_hypotheses_.top().md)
               continue;
           }
 
           MatchInfo extended = mi;
           extended.hypothesis.push_back(inn);
           extended.num_pairings += 1;
-          if (jc(ti, mi))
+          if (jc(ti, mi)) {
             ti.stack.push(extended);
-        }
-        FastSet<Key> remaining;
-        for (int j = k + 1; j < ti.innovations.size(); ++j) {
-          for (Innovation::shared_ptr &future_inn : ti.innovations[j]) {
-            if (existing.find(future_inn->l) == existing.end())
-              remaining.insert(future_inn->l);
           }
-        }
-        int max_remaining = std::min(remaining.size(), ti.innovations.size() - k - 1);
-        if (best_hypothesis_.empty() ||
-            h + max_remaining >= best_hypotheses_.top().num_pairings) {
-          MatchInfo extended = mi;
-          extended.hypothesis.push_back(nullptr);
-          ti.stack.push(extended);
         }
       }
     }
     return true;
   }
 
-  bool screen(const MatchInfo &mi) {
+  /// Remove redundant matching result from the same track.
+  bool screen1(const MatchInfo &mi) {
+    decltype(best_hypotheses_) copy;
+
+    bool valid = true;
+    while (!best_hypotheses_.empty()) {
+      MatchInfo existing_mi = best_hypotheses_.top();
+      best_hypotheses_.pop();
+
+      if (!valid || mi.track != existing_mi.track) {
+        copy.push(existing_mi);
+        continue;
+      }
+
+      Vector e = existing_mi.pose.localCoordinates(mi.pose);
+      double md = e.transpose() * existing_mi.covariance.inverse() * e;
+      if (sqrt(md) < posterior_pose_md_threshold_) {
+        if (MatchInfoCmp()(existing_mi, mi)) {
+          copy.push(existing_mi);
+          valid = false;
+        }
+      } else {
+        copy.push(existing_mi);
+      }
+    }
+    best_hypotheses_ = copy;
+    return valid;
+  }
+
+  /// Remove redundant empty matching result.
+  void screen2() {
+    decltype(best_hypotheses_) copy;
+
+    FastVector<MatchInfo> null, nonnull;
+    while (!best_hypotheses_.empty()) {
+      MatchInfo mi = best_hypotheses_.top();
+      best_hypotheses_.pop();
+
+      if (mi.num_pairings) {
+        copy.push(mi);
+        nonnull.push_back(mi);
+      } else {
+        null.push_back(mi);
+      }
+    }
+
+    for (const MatchInfo &mi1 : null) {
+      bool valid = true;
+      for (const MatchInfo &mi2 : nonnull) {
+        Vector e = mi2.pose.localCoordinates(mi1.pose);
+        double md = e.transpose() * mi2.covariance.inverse() * e;
+        if (sqrt(md) < posterior_pose_md_threshold_) {
+          valid = false;
+          break;
+        }
+      }
+
+      if (valid)
+        copy.push(mi1);
+    }
+    best_hypotheses_ = copy;
   }
 
   int pairings(const FastVector<Innovation::shared_ptr> &hypothesis) const {
@@ -423,7 +544,7 @@ class MHJCBB {
 
   bool jc_(const TrackInfo &ti, const Innovation::shared_ptr &inn) const {
     Matrix S = Matrix::Zero(5, 5);
-    S.block<3, 3>(0, 0) = ti.marginals.marginalCovariance(x0_);
+    S.block<3, 3>(0, 0) = ti.marginals.marginalCovariance(ti.x0);
     S.block<2, 2>(3, 3) = ti.marginals.marginalCovariance(inn->l);
 
     Matrix H(2, 5);
@@ -438,11 +559,13 @@ class MHJCBB {
     return chi2 < chi2inv(prob_, 2);
   }
 
+  /// JC test.
+  /// Update posterior pose and covariance in MatchInfo.
   bool jc(const TrackInfo &ti, MatchInfo &mi) const {
-    if (hypothesis.size() <= 1) return true;
+    if (!mi.num_pairings) return true;
 
     int XD = POSE::dimension, LD = POINT::dimension,
-        FD = BearingRange::dimension;
+        FD = BearingRange<POSE, POINT>::dimension;
     int N = XD, M = 0;
     KeyVector keys;
     keys.push_back(ti.x0);
@@ -479,17 +602,27 @@ class MHJCBB {
       j += 1;
     }
 
+    // update step in Kalman filter
     Matrix C = H * S * H.transpose() + R * R;
-    double chi2 = e.transpose() * C.llt().solve(e);
+    Matrix C_1 = C.inverse();
+    Matrix K = S * H.transpose() * C_1;
+    Vector d = -K * e;
+
+    mi.pose = ti.values.template at<POSE>(ti.x0).retract(d.head(XD));
+    mi.covariance = S.topLeftCorner(XD, XD) - K.topRows(XD) * H * S.leftCols(XD);
+
+    double chi2 = e.transpose() * C_1 * e;
     return chi2 < chi2inv(prob_, M);
   }
 
  private:
   int max_tracks_;
   double prob_;
+  double posterior_pose_md_threshold_;
 
   FastVector<TrackInfo> tracks_;
-  std::priority_queue<MatchInfo, std::vector<MatchInfo>, MatchInfoCmd> best_hypotheses_;
+  std::priority_queue<MatchInfo, std::vector<MatchInfo>, MatchInfoCmp> best_hypotheses_;
+  FastVector<std::pair<int, KeyVector>> result_;
 };
 
 double normalCDF(double u) {
