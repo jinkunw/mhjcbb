@@ -59,7 +59,7 @@ def slam(sim, da='jcbb', prob=0.95):
                     observed.add(l_true)
         elif da == 'jcbb':
             ################################################################################
-            jcbb = gtsam.da_JCBB2(isam2.getFactorsUnsafe(), estimate, prob)
+            jcbb = gtsam.da_JCBB2(isam2, prob)
             for l, br in obs.items():
                 br_model = gtsam.noiseModel_Diagonal.Sigmas(np.array([sim.sigma_bearing, sim.sigma_range]))
                 jcbb.add(gtsam.Rot2(br[0]), br[1], br_model)
@@ -147,7 +147,7 @@ def mhjcbb(sim, num_tracks=10, prob=0.95, posterior_pose_md_threshold=1.5, prune
         ################################################################################
         mhjcbb = gtsam.da_MHJCBB2(num_tracks, prob, posterior_pose_md_threshold)
         for isam2, observed, in slams:
-            mhjcbb.initialize(isam2.getFactorsUnsafe(), isam2.calculateEstimate())
+            mhjcbb.initialize(isam2)
 
         for l, br in obs.items():
             br_model = gtsam.noiseModel_Diagonal.Sigmas(np.array([sim.sigma_bearing, sim.sigma_range]))

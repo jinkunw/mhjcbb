@@ -3,7 +3,14 @@
 #include <gtsam/inference/Key.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/linear/NoiseModel.h>
+
+#define USE_FAST_MARGINALS
+#ifdef USE_FAST_MARGINALS
+#include <gtsam/nonlinear/FastMarginals.h>
+#endif
+#include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/nonlinear/Marginals.h>
+
 #include <gtsam/sam/BearingRangeFactor.h>
 #include <Eigen/Cholesky>
 
@@ -39,9 +46,13 @@ class JCBB {
   ///   1. Pose and landmark keys are represented by X(x) and L(l).
   ///   2. Pose keys are incremental from 0 to N.
   ///   3. The associated landmark keys are also incremental.
-  JCBB(const NonlinearFactorGraph &graph, const Values &values, double prob)
-      : values_(values), prob_(prob) {
-    marginals_ = Marginals(graph, values_);
+  JCBB(const ISAM2 &isam2, double prob)
+      : values_(isam2.calculateEstimate()), prob_(prob),
+#ifdef USE_FAST_MARGINALS
+        marginals_(isam2) {
+#else
+        marginals_(isam2.getFactorsUnsafe(), values_) {
+#endif
     for (Key key : values_.keys())
       if (symbolChr(key) == 'l') keys_.push_back(key);
 
@@ -88,7 +99,9 @@ class JCBB {
         if (std::find(keys.begin(), keys.end(), inn->l) == keys.end())
           keys.push_back(inn->l);
     }
+#ifndef USE_FAST_MARGINALS
     joint_marginals_ = marginals_.jointMarginalCovariance(keys);
+#endif
 
     // Sort candidate landmarks by its residual.
     // A heuristic to quickly obtain a lower bound.
@@ -212,6 +225,9 @@ class JCBB {
     }
 
     Matrix S(N, N);
+#ifdef USE_FAST_MARGINALS
+    S = marginals_.jointMarginalCovariance(keys);
+#else
     for (int i = 0, p = 0; i < keys.size(); ++i) {
       Key ki = keys[i];
       int pi = values_.at(ki).dim();
@@ -224,6 +240,7 @@ class JCBB {
       p += pi;
     }
     S.triangularView<Eigen::Lower>() = S.transpose();
+#endif
 
     Matrix H = Matrix::Zero(M, N);
     Matrix R = Matrix::Zero(M, M);
@@ -249,11 +266,16 @@ class JCBB {
   FastVector<Innovation::shared_ptr> best_hypothesis_;
 
   KeyVector keys_;
-  Marginals marginals_;
-  JointMarginal joint_marginals_;
   Values values_;
   Key x0_;
   POSE pose0_;
+
+#ifdef USE_FAST_MARGINALS
+  mutable FastMarginals marginals_;
+#else
+  Marginals marginals_;
+  JointMarginal joint_marginals_;
+#endif
 };
 
 template <typename POSE, typename POINT,
@@ -284,8 +306,14 @@ class MHJCBB {
     int index;                                                   // track index
     FastVector<FastVector<Innovation::shared_ptr>> innovations;  // candidates for each measurement
     KeyVector keys;                                              // Same as members in JCBB
+#ifdef USE_FAST_MARGINALS
+    mutable FastMarginals marginals;
+
+    TrackInfo(const ISAM2 &isam2) : marginals(isam2) {}
+#else
     Marginals marginals;
     JointMarginal joint_marginals;
+#endif
     Values values;
     Key x0;
     POSE pose0;
@@ -304,19 +332,26 @@ class MHJCBB {
 
   /// Initialize a track with a complete factor graph and estimate.
   /// Call multiple times if there are multiple tracks.
-  void initialize(const NonlinearFactorGraph &graph, const Values &values) {
+  void initialize(const ISAM2 &isam2) {
+#ifdef USE_FAST_MARGINALS
+    tracks_.push_back(TrackInfo(isam2));
+    TrackInfo &track = tracks_.back();
+    track.values = isam2.calculateEstimate();
+#else
     tracks_.push_back(TrackInfo());
     TrackInfo &track = tracks_.back();
-    track.values = values;
-    track.marginals = Marginals(graph, values);
-    for (Key key : values.keys())
+    track.values = isam2.calculateEstimate();
+    track.marginals = Marginals(isam2.getFactorsUnsafe(), track.values);
+#endif
+
+    for (Key key : track.values.keys())
       if (symbolChr(key) == 'l') track.keys.push_back(key);
 
     for (int x = 0;; ++x) {
-      if (!values.exists(X(x))) {
+      if (!track.values.exists(X(x))) {
         assert(x > 0);
         track.x0 = X(x - 1);
-        track.pose0 = values.at<POSE>(track.x0);
+        track.pose0 = track.values.template at<POSE>(track.x0);
         break;
       }
     }
@@ -358,7 +393,9 @@ class MHJCBB {
           if (std::find(keys.begin(), keys.end(), inn->l) == keys.end())
             keys.push_back(inn->l);
       }
+#ifndef USE_FAST_MARGINALS
       track.joint_marginals = track.marginals.jointMarginalCovariance(keys);
+#endif
 
       // Sort in reverse order due to stack.
       for (FastVector<Innovation::shared_ptr> &linn : track.innovations)
@@ -577,6 +614,9 @@ class MHJCBB {
     }
 
     Matrix S(N, N);
+#ifdef USE_FAST_MARGINALS
+    S = ti.marginals.jointMarginalCovariance(keys);
+#else
     for (int i = 0, p = 0; i < keys.size(); ++i) {
       Key ki = keys[i];
       int pi = ti.values.at(ki).dim();
@@ -589,6 +629,7 @@ class MHJCBB {
       p += pi;
     }
     S.triangularView<Eigen::Lower>() = S.transpose();
+#endif
 
     Matrix H = Matrix::Zero(M, N);
     Matrix R = Matrix::Zero(M, M);
